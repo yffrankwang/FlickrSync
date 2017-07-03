@@ -83,4 +83,4 @@ Configure options for file synchronization:
 --------------------
 A token file is created during execution:
 
-* `.flickrsync.json`: which has the token to authenticate to Flickr
+* `.flickrsync.token`: which has the token to authenticate to Flickr

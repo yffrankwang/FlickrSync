@@ -617,6 +617,7 @@ class FlickrSync:
 		self.syncQueue = None
 		self.syncCount = 0
 		self.rnews = {}
+		self.skips = []
 
 	def print_albums(self, albums):
 		uprint("--------------------------------------------------------------------------------")
@@ -652,7 +653,16 @@ class FlickrSync:
 
 	def print_updates(self, photos):
 		if photos:
+			uprint("--------------------------------------------------------------------------------")
 			uprint("Photos to be synchronized:")
+			for f in photos:
+				uprint(u"%s: %s  [%s] (%s) %s" % (f.action, f.title, szstr(f.fsize), mtstr(f.mdate), f.reason))
+
+
+	def print_skips(self, photos):
+		if photos:
+			uprint("--------------------------------------------------------------------------------")
+			uprint("Skipped photos:")
 			for f in photos:
 				uprint(u"%s: %s  [%s] (%s) %s" % (f.action, f.title, szstr(f.fsize), mtstr(f.mdate), f.reason))
 
@@ -704,7 +714,7 @@ class FlickrSync:
 						p.mdate = a['mdate']
 						p.fsize = a['fsize']
 					except Exception, e:
-						uwarn('Invaid description: %s - %s' % (p.description, str(e)))
+						uwarn('Invalid description: %s - %s' % (p.description, str(e)))
 				p.action = ''
 				p.reason = ''
 				p.npath = os.path.abspath(config.root_dir + p.title)
@@ -940,6 +950,7 @@ class FlickrSync:
 				if ans.lower() != "y":
 					return
 			self.patch_files(pfiles)
+			uprint("--------------------------------------------------------------------------------")
 			uinfo("PATCH Completed!")
 		else:
 			uinfo('No files need to be patched.')
@@ -958,6 +969,7 @@ class FlickrSync:
 				if ans.lower() != "y":
 					return
 			self.touch_files(pfiles)
+			uprint("--------------------------------------------------------------------------------")
 			uinfo("TOUCH Completed!")
 		else:
 			uinfo('No files need to be touched.')
@@ -982,6 +994,7 @@ class FlickrSync:
 			self.upload_files(ufiles)
 			if force:
 				self.up_to_date()
+			uprint("--------------------------------------------------------------------------------")
 			uinfo("PUSH %s Completed!" % ('(FORCE)' if force else ''))
 		else:
 			uinfo('No files need to be uploaded to remote server.')
@@ -1005,6 +1018,7 @@ class FlickrSync:
 			self.dnload_files(dfiles)
 			if force:
 				self.up_to_date()
+			uprint("--------------------------------------------------------------------------------")
 			uinfo("PULL %s Completed!" % ('(FORCE)' if force else ''))
 		else:
 			uinfo('No files need to be downloaded to local.')
@@ -1026,6 +1040,7 @@ class FlickrSync:
 					return
 			self.sync_files(sfiles)
 			self.up_to_date()
+			uprint("--------------------------------------------------------------------------------")
 			uinfo("SYNC Completed!")
 		else:
 			self.up_to_date()
@@ -1083,6 +1098,7 @@ class FlickrSync:
 	
 	def insert_remote_file(self, lf):
 		if lf.fsize > config.max_file_size:
+			self.skips.append(lf)
 			uwarn("%s Unable to upload %s, File size [%s] exceed the limit" % (self.prog(), lf.title, szstr(lf.fsize)))
 			return
 
@@ -1102,6 +1118,7 @@ class FlickrSync:
 
 	def update_remote_file(self, rf, lf):
 		if lf.fsize > config.max_file_size:
+			self.skips.append(lf)
 			uwarn("%s Unable to update %s, File size [%s] excceed the limit" % (self.prog(), lf.title, szstr(lf.fsize)))
 			return
 
@@ -1257,6 +1274,8 @@ class FlickrSync:
 					uinfo("Keyboard interrupt seen, abandon threads")
 					uprint(">>>>>> Stopping threads...")
 					self.abandon = True
+		
+		self.print_skips(self.skips)
 
 	def sync_run(self):
 		while not self.abandon:
