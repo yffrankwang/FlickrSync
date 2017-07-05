@@ -18,6 +18,7 @@ import logging
 import datetime
 import time
 import pytz, tzlocal
+import dateutil.parser
 import mimetools
 import mimetypes
 import Queue
@@ -39,7 +40,7 @@ except Exception:
 LTZ = tzlocal.get_localzone()
 SENC = sys.getdefaultencoding()
 FENC = sys.getfilesystemencoding()
-DT1970 = datetime.datetime.fromtimestamp(0).replace(tzinfo=LTZ)
+DT1970 = datetime.datetime.fromtimestamp(0)
 LOG = None
 
 
@@ -98,16 +99,16 @@ def szstr(n):
 	return "{:,}".format(n)
 
 def todate(s):
-	return datetime.datetime.strptime(s, '%Y-%m-%dT%H:%M:%S%z').astimezone(LTZ)
+	return dateutil.parser.parse(s).replace(microsecond=0).astimezone(LTZ).replace(tzinfo=None)
 
 def tmstr(t):
-	return t.strftime('%Y-%m-%dT%H:%M:%S%z')
+	return t.strftime('%Y-%m-%d %H:%M:%S')
 
-def utime(d):
-	return d.astimezone(pytz.utc).strftime('%Y-%m-%dT%H:%M:%S.000Z')
+def mtstr(t):
+	return LTZ.localize(t).strftime('%Y-%m-%dT%H:%M:%S%z')
 
 def mtime(p):
-	return datetime.datetime.fromtimestamp(os.path.getmtime(p)).replace(microsecond=0, tzinfo=LTZ)
+	return datetime.datetime.fromtimestamp(os.path.getmtime(p)).replace(microsecond=0)
 
 def ftime(dt):
 	return tseconds(dt - DT1970)
@@ -116,7 +117,7 @@ def tseconds(td):
 	return (td.seconds + td.days * 24 * 3600)
 
 def touch(p, d = None):
-	atime = ftime(datetime.datetime.now().replace(tzinfo=LTZ))
+	atime = ftime(datetime.datetime.now())
 	mtime = atime if d is None else ftime(d)
 	os.utime(p, ( atime, mtime ))
 
@@ -556,7 +557,7 @@ class FlickrService:
 		photo.isfriend = str(config.friend)
 		photo.isfamily = str(config.family)
 
-		meta = { 'fsize': photo.fsize, 'mdate': tmstr(photo.mdate) }
+		meta = { 'fsize': photo.fsize, 'mdate': mtstr(photo.mdate) }
 		photo.description = json.dumps(meta)
 
 		p = ('photo', urllib2.quote(photo.title.encode('utf8')), data)
@@ -588,7 +589,7 @@ class FlickrService:
 		with open(photo.npath, 'rb') as f:
 			data = f.read()
 
-		meta = { 'fsize': photo.fsize, 'mdate': tmstr(photo.mdate) }
+		meta = { 'fsize': photo.fsize, 'mdate': mtstr(photo.mdate) }
 		photo.description = json.dumps(meta)
 
 		p = ('photo', urllib2.quote(photo.title.encode('utf8')), data)
@@ -651,7 +652,7 @@ class FlickrSync:
 			p = photos[n]
 
 			tz += p.fsize
-			uprint(u"  %s [%s] (%s) %s" % (p.title, szstr(p.fsize), tmstr(p.mdate), ("" if (not url) or (not p.url) else p.url)))
+			uprint(u"  %-40s [%11s] (%s) %s" % (p.title, szstr(p.fsize), tmstr(p.mdate), ("" if (not url) or (not p.url) else p.url)))
 
 		uprint("--------------------------------------------------------------------------------")
 		uprint("Total %d photos [%s]" % (len(photos), szstr(tz)))
@@ -882,7 +883,7 @@ class FlickrSync:
 			# check updateable
 			lf = self.lpaths.get(rp)
 			if lf:
-				if rf.mdate - lf.mdate <= 2:
+				if tseconds(rf.mdate - lf.mdate) <= 2:
 					if not force or lf.fsize == rf.fsize:
 						continue
 				rf.action = '>*'
@@ -1190,7 +1191,7 @@ class FlickrSync:
 		'''
 		uinfo("%s ^PATCH^  %s [%s] (%s)" % (self.prog(), rf.title, szstr(fsize), tmstr(mdate)))
 
-		meta = { 'fsize': fsize, 'mdate': tmstr(mdate) }
+		meta = { 'fsize': fsize, 'mdate': mtstr(mdate) }
 		desc = json.dumps(meta)
 		
 		rf.setMeta(rf.title, desc)
@@ -1230,7 +1231,7 @@ class FlickrSync:
 			
 			shutil.move(lf.npath, np)
 		else:
-			uinfo("%s >REMOVE>  %s" % (self.prog(), lf.path))
+			uinfo("%s >REMOVE> %s" % (self.prog(), lf.path))
 			os.remove(lf.npath)
 
 	def remove_local_file(self, lf):
