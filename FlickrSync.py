@@ -18,7 +18,6 @@ import logging
 import datetime
 import time
 import pytz, tzlocal
-import dateutil.parser
 import mimetools
 import mimetypes
 import Queue
@@ -40,7 +39,7 @@ except Exception:
 LTZ = tzlocal.get_localzone()
 SENC = sys.getdefaultencoding()
 FENC = sys.getfilesystemencoding()
-DT1970 = datetime.datetime(1970,1,1).replace(tzinfo=pytz.utc)
+DT1970 = datetime.datetime.fromtimestamp(0).replace(tzinfo=LTZ)
 LOG = None
 
 
@@ -94,24 +93,31 @@ def uexception(ex):
 	if LOG:
 		LOG.exception(ex)
 
+
 def szstr(n):
 	return "{:,}".format(n)
+
+def todate(s):
+	return datetime.datetime.strptime(s, '%Y-%m-%dT%H:%M:%S%z').astimezone(LTZ)
+
+def tmstr(t):
+	return t.strftime('%Y-%m-%dT%H:%M:%S%z')
 
 def utime(d):
 	return d.astimezone(pytz.utc).strftime('%Y-%m-%dT%H:%M:%S.000Z')
 
-def mtstr(t):
-	return datetime.datetime.fromtimestamp(t).strftime('%Y-%m-%d %H:%M:%S')
+def mtime(p):
+	return datetime.datetime.fromtimestamp(os.path.getmtime(p)).replace(microsecond=0, tzinfo=LTZ)
 
 def ftime(dt):
-	return tseconds(dt.astimezone(pytz.utc) - DT1970)
+	return tseconds(dt - DT1970)
 
 def tseconds(td):
 	return (td.seconds + td.days * 24 * 3600)
 
 def touch(p, d = None):
 	atime = ftime(datetime.datetime.now().replace(tzinfo=LTZ))
-	mtime = atime if d is None else d
+	mtime = atime if d is None else ftime(d)
 	os.utime(p, ( atime, mtime ))
 
 def mkpdirs(p):
@@ -120,12 +126,13 @@ def mkpdirs(p):
 		os.makedirs(d)
 
 def trimdir(p):
+	if p == '':
+		return p
+
 	if p[-1] == os.path.sep:
 		p = p[:-1]
 	return unicode(p)
 
-def todate(d):
-	return dateutil.parser.parse(d).replace(microsecond=0).astimezone(LTZ)
 
 class APIConstants:
 	base = "https://flickr.com/services/"
@@ -175,7 +182,7 @@ class Config:
 		# user webbrowser
 		self.webbrowser = True if self.get('webbrowser', 'true') == 'true' else False 
 
-		# max_file_size
+		# max_file_size (1GB)
 		self.max_file_size = int(self.get('max_file_size', '1073741824'))
 
 		# max retry
@@ -203,15 +210,15 @@ class Config:
 		self.token_file = self.get('token_file', '.flickrsync.token')
 
 		if os.path.exists(self.token_file):
-			self.last_sync = os.path.getmtime(self.token_file)
+			self.last_sync = mtime(self.token_file)
 		else:
-			self.last_sync = 0
+			self.last_sync = DT1970
 
 		# Flickr settings
 		self.hidden = self.get('hidden', 2)
 		self.public = self.get('public', 0)
 		self.friend = self.get('friend', 0)
-		self.family = self.get('fammily', 1)
+		self.family = self.get('family', 1)
 
 	def get(self, configparam, default=None):
 		"""get the value from the ini file's default section."""
@@ -526,7 +533,7 @@ class FlickrService:
 			try:
 				cnt += 1
 				return api.execute()
-			except errors.HttpError as e:
+			except Exception as e:
 				if cnt <= config.max_retry:
 					uwarn(str(e))
 					uwarn("Failed to %s, retry %d" % (msg, cnt))
@@ -549,7 +556,7 @@ class FlickrService:
 		photo.isfriend = str(config.friend)
 		photo.isfamily = str(config.family)
 
-		meta = { 'fsize': photo.fsize, 'mdate': photo.mdate }
+		meta = { 'fsize': photo.fsize, 'mdate': tmstr(photo.mdate) }
 		photo.description = json.dumps(meta)
 
 		p = ('photo', urllib2.quote(photo.title.encode('utf8')), data)
@@ -581,7 +588,7 @@ class FlickrService:
 		with open(photo.npath, 'rb') as f:
 			data = f.read()
 
-		meta = { 'fsize': photo.fsize, 'mdate': photo.mdate }
+		meta = { 'fsize': photo.fsize, 'mdate': tmstr(photo.mdate) }
 		photo.description = json.dumps(meta)
 
 		p = ('photo', urllib2.quote(photo.title.encode('utf8')), data)
@@ -597,7 +604,7 @@ class FlickrService:
 		res = self._get_xml(req)
 		if self._is_good(res):
 			photoid = str(res.photoid.text)
-			photo.setMeta(rf.title, desc)
+			photo.setMeta()
 			return photoid
 		else:
 			self._report_error(res)
@@ -638,17 +645,16 @@ class FlickrSync:
 		uprint("--------------------------------------------------------------------------------")
 
 		tz = 0
-		lp = ''
 		ks = list(photos.keys())
 		ks.sort()
 		for n in ks:
 			p = photos[n]
 
 			tz += p.fsize
-			uprint(u"  %-50s  %s  %8d %s" % (p.title, mtstr(p.mdate), p.fsize, ("" if (not url) or (not p.url) else p.url)))
+			uprint(u"  %s [%s] (%s) %s" % (p.title, szstr(p.fsize), tmstr(p.mdate), ("" if (not url) or (not p.url) else p.url)))
 
 		uprint("--------------------------------------------------------------------------------")
-		uprint("Total %d photos (%s)" % (len(photos), szstr(tz)))
+		uprint("Total %d photos [%s]" % (len(photos), szstr(tz)))
 
 
 	def print_updates(self, photos):
@@ -656,7 +662,7 @@ class FlickrSync:
 			uprint("--------------------------------------------------------------------------------")
 			uprint("Photos to be synchronized:")
 			for f in photos:
-				uprint(u"%s: %s  [%s] (%s) %s" % (f.action, f.title, szstr(f.fsize), mtstr(f.mdate), f.reason))
+				uprint(u"%s: %s [%s] (%s) %s" % (f.action, f.title, szstr(f.fsize), tmstr(f.mdate), f.reason))
 
 
 	def print_skips(self, photos):
@@ -664,7 +670,7 @@ class FlickrSync:
 			uprint("--------------------------------------------------------------------------------")
 			uprint("Skipped photos:")
 			for f in photos:
-				uprint(u"%s: %s  [%s] (%s) %s" % (f.action, f.title, szstr(f.fsize), mtstr(f.mdate), f.reason))
+				uprint(u"%s: %s [%s] (%s) %s" % (f.action, f.title, szstr(f.fsize), tmstr(f.mdate), f.reason))
 
 
 	def get(self, fid):
@@ -706,13 +712,13 @@ class FlickrSync:
 				if not self.accept_path(p.title):
 					continue
 				
-				p.mdate = 0
+				p.mdate = DT1970
 				p.fsize = -1
 				if p.description:
 					try:
 						a = json.loads(p.description)
-						p.mdate = a['mdate']
 						p.fsize = a['fsize']
+						p.mdate = todate(a['mdate'])
 					except Exception, e:
 						uwarn('Invalid description: %s - %s' % (p.description, str(e)))
 				p.action = ''
@@ -777,7 +783,7 @@ class FlickrSync:
 				fp.npath = np
 				fp.title = normpath(rp)
 				fp.fsize = os.path.getsize(np)
-				fp.mdate = os.path.getmtime(np)
+				fp.mdate = mtime(np)
 				lpaths[fp.title] = fp
 
 		self.lpaths = lpaths
@@ -793,9 +799,9 @@ class FlickrSync:
 		for lp,lf in self.lpaths.items():
 			# check patchable
 			rf = self.rpaths.get(lp)
-			if rf and (rf.fsize == -1 or rf.mdate == 0 or (lf.fsize == rf.fsize and math.fabs(rf.mdate - lf.mdate) > 2)):
+			if rf and lf.fsize == rf.fsize and math.fabs(tseconds(rf.mdate - lf.mdate)) > 2:
 				lf.action = '^~'
-				lf.reason = '| <> R:' + mtstr(rf.mdate)
+				lf.reason = '| <> R:' + tmstr(rf.mdate)
 				lps.append(lp)
 
 		lps.sort()
@@ -814,9 +820,9 @@ class FlickrSync:
 		for rp,rf in self.rpaths.items():
 			# check touchable
 			lf = self.lpaths.get(rp)
-			if lf and (rf.fsize == -1 or rf.mdate == 0 or (lf.fsize == rf.fsize and math.fabs(rf.mdate - lf.mdate) > 2)):
+			if lf and lf.fsize == rf.fsize and math.fabs(tseconds(rf.mdate - lf.mdate)) > 2:
 				rf.action = '>~'
-				rf.reason = '| <> L:' + mtstr(lf.mdate)
+				rf.reason = '| <> L:' + tmstr(lf.mdate)
 				rps.append(rp)
 
 		rps.sort()
@@ -836,13 +842,13 @@ class FlickrSync:
 			# check updateable
 			rf = self.rpaths.get(lp)
 			if rf:
-				if lf.mdate - rf.mdate <= 2:
+				if tseconds(lf.mdate - rf.mdate) <= 2:
 					if not force or lf.fsize == rf.fsize:
 						continue
 				lf.action = '^*'
-				lf.reason = '| > R:' + mtstr(rf.mdate)
+				lf.reason = '| > R:' + tmstr(rf.mdate)
 			elif lastsync:
-				if lf.mdate - lastsync > 2:
+				if tseconds(lf.mdate - lastsync) > 2:
 					lf.action = '^+'
 				else:
 					lf.action = '>-'
@@ -880,9 +886,9 @@ class FlickrSync:
 					if not force or lf.fsize == rf.fsize:
 						continue
 				rf.action = '>*'
-				rf.reason = '| > L:' + mtstr(lf.mdate)
+				rf.reason = '| > L:' + tmstr(lf.mdate)
 			elif lastsync:
-				if rf.mdate - lastsync > 2:
+				if tseconds(rf.mdate - lastsync) > 2:
 					rf.action = '>+'
 				else:
 					rf.action = '^-'
@@ -924,16 +930,39 @@ class FlickrSync:
 			
 		return sfiles
 
+	def sync_file(self, sf):
+		if sf.action == '^-':
+			self.trash_remote_file(sf)
+		elif sf.action == '^*':
+			rf = self.rpaths[sf.title]
+			self.update_remote_file(rf, sf)
+		elif sf.action == '^+':
+			self.insert_remote_file(sf)
+		elif sf.action == '^~':
+			rf = self.rpaths[sf.title]
+			self.patch_remote_file(rf, sf.mdate, sf.fsize)
+		elif sf.action in ('>*', '>+'):
+			self.download_remote_file(sf)
+		elif sf.action == '>/':
+			self.create_local_dirs(sf)
+		elif sf.action == '>-':
+			self.trash_local_file(sf)
+		elif sf.action == '>!':
+			self.remove_local_file(sf)
+		elif sf.action == '>~':
+			lf = self.lpaths[sf.title]
+			self.touch_local_file(lf, sf.mdate)
+
 	def upload_files(self, lfiles):
 		self.sync_files(lfiles)
 
 	def dnload_files(self, rfiles):
 		self.sync_files(rfiles)
 
-	def patch_files(self, pfiles):
+	def touch_files(self, pfiles):
 		self.sync_files(pfiles)
 
-	def touch_files(self, pfiles):
+	def patch_files(self, pfiles):
 		self.sync_files(pfiles)
 
 	def patch(self, noprompt):
@@ -973,8 +1002,7 @@ class FlickrSync:
 			uinfo("TOUCH Completed!")
 		else:
 			uinfo('No files need to be touched.')
-		
-		
+
 	def push(self, force = False, noprompt = False):
 		# get remote files
 		self.list()
@@ -997,6 +1025,7 @@ class FlickrSync:
 			uprint("--------------------------------------------------------------------------------")
 			uinfo("PUSH %s Completed!" % ('(FORCE)' if force else ''))
 		else:
+			uprint("--------------------------------------------------------------------------------")
 			uinfo('No files need to be uploaded to remote server.')
 
 	def pull(self, force = False, noprompt = False):
@@ -1021,6 +1050,7 @@ class FlickrSync:
 			uprint("--------------------------------------------------------------------------------")
 			uinfo("PULL %s Completed!" % ('(FORCE)' if force else ''))
 		else:
+			uprint("--------------------------------------------------------------------------------")
 			uinfo('No files need to be downloaded to local.')
 
 	def sync(self, noprompt):
@@ -1044,6 +1074,7 @@ class FlickrSync:
 			uinfo("SYNC Completed!")
 		else:
 			self.up_to_date()
+			uprint("--------------------------------------------------------------------------------")
 			uinfo('No files need to be synchronized.')
 
 
@@ -1054,7 +1085,7 @@ class FlickrSync:
 		"""
 		Move a remote file to the trash.
 		"""
-		uinfo("%s ^TRASH^  %s [%s] (%s)" % (self.prog(), file.title, szstr(file.fsize), mtstr(file.mdate)))
+		uinfo("%s ^TRASH^  %s [%s] (%s)" % (self.prog(), file.title, szstr(file.fsize), tmstr(file.mdate)))
 
 		file.delete()
 		with LOCK:
@@ -1107,7 +1138,7 @@ class FlickrSync:
 		'''
 		Upload a file to remote.
 		'''
-		uinfo("%s ^UPLOAD^ %s [%s] (%s) #(%s)" % (self.prog(), lf.title, szstr(lf.fsize), mtstr(lf.mdate), lf.tags))
+		uinfo("%s ^UPLOAD^ %s [%s] (%s) #(%s)" % (self.prog(), lf.title, szstr(lf.fsize), tmstr(lf.mdate), lf.tags))
 		lf.id = self.service.upload(lf)
 		if lf.id:
 			with LOCK:
@@ -1127,7 +1158,7 @@ class FlickrSync:
 		'''
 		Update a file to remote.
 		'''
-		uinfo("%s ^UPDATE^ %s [%s] (%s) #(%s)" % (self.prog(), lf.title, szstr(lf.fsize), mtstr(lf.mdate), lf.tags))
+		uinfo("%s ^UPDATE^ %s [%s] (%s) #(%s)" % (self.prog(), lf.title, szstr(lf.fsize), tmstr(lf.mdate), lf.tags))
 
 		lf.id = self.service.update(lf)
 		if lf.id:
@@ -1137,7 +1168,7 @@ class FlickrSync:
 			rf.tags = lf.tags
 
 	def download_remote_file(self, rf):
-		uinfo("%s >DNLOAD> %s [%s] (%s)" % (self.prog(), rf.title, szstr(rf.fsize), mtstr(rf.mdate)))
+		uinfo("%s >DNLOAD> %s [%s] (%s)" % (self.prog(), rf.title, szstr(rf.fsize), tmstr(rf.mdate)))
 		
 		mkpdirs(rf.npath)
 
@@ -1157,9 +1188,9 @@ class FlickrSync:
 		'''
 		Patch a remote file.
 		'''
-		uinfo("%s ^PATCH^  %s [%s] (%s)" % (self.prog(), rf.title, szstr(fsize), mtstr(mdate)))
+		uinfo("%s ^PATCH^  %s [%s] (%s)" % (self.prog(), rf.title, szstr(fsize), tmstr(mdate)))
 
-		meta = { 'fsize': fsize, 'mdate': mdate }
+		meta = { 'fsize': fsize, 'mdate': tmstr(mdate) }
 		desc = json.dumps(meta)
 		
 		rf.setMeta(rf.title, desc)
@@ -1168,24 +1199,23 @@ class FlickrSync:
 		rf.fsize = fsize
 		return rf
 
-	def touch_local_file(self, lf, mdate):
+	def touch_local_file(self, lf, mt):
 		'''
 		Touch a local file.
 		'''
-		uinfo("%s >TOUCH>  %s [%s] (%s)" % (self.prog(), lf.title, szstr(lf.fsize), mtstr(mdate)))
+		uinfo("%s >TOUCH>  %s [%s] (%s)" % (self.prog(), lf.title, szstr(lf.fsize), tmstr(mt)))
 
-		ft = mdate
-		os.utime(lf.npath, (ft, ft))
+		touch(lf.npath, mt)
 
-		lf.mdate = mdate
+		lf.mdate = mt
 		return lf
 
-	def create_local_dirs(self, file):
+	def create_local_dirs(self, lf):
 		np = file.npath
 		if os.path.exists(np):
 			return
 
-		uinfo("%s >CREATE> %s" % (self.prog(), file.title))
+		uinfo("%s >CREATE> %s" % (self.prog(), lf.title))
 		os.makedirs(np)
 
 	def trash_local_file(self, lf):
@@ -1212,29 +1242,6 @@ class FlickrSync:
 		
 	def prog(self):
 		return ('[%d/%d]' % (self.syncCount - self.syncQueue.qsize(), self.syncCount))
-
-	def sync_file(self, sf):
-		if sf.action == '^-':
-			self.trash_remote_file(sf)
-		elif sf.action == '^*':
-			rf = self.rpaths[sf.title]
-			self.update_remote_file(rf, sf)
-		elif sf.action == '^+':
-			self.insert_remote_file(sf)
-		elif sf.action == '^~':
-			rf = self.rpaths[sf.title]
-			self.patch_remote_file(rf, sf.mdate, sf.fsize)
-		elif sf.action in ('>*', '>+'):
-			self.download_remote_file(sf)
-		elif sf.action == '>/':
-			self.create_local_dirs(sf)
-		elif sf.action == '>-':
-			self.trash_local_file(sf)
-		elif sf.action == '>!':
-			self.remove_local_file(sf)
-		elif sf.action == '>~':
-			lf = self.lpaths[sf.title]
-			self.touch_local_file(lf, sf.mdate)
 
 	def sync_files(self, sfiles):
 		self.syncCount = len(sfiles)
@@ -1399,7 +1406,7 @@ class FlickrSync:
 
 		a = self.albums.get(atitle)
 		if a:
-			uinfo("List photos of album [%s]: %s" % (album, sb))
+			uinfo("List photos of album [%s]:" % (atitle))
 			ps = a.getPhotos()
 			self.print_photos(ps)
 		else:
@@ -1454,6 +1461,7 @@ class FlickrSync:
 			if ans.lower() != "y":
 				return
 
+		sfiles = []
 		pns.sort()
 		for k in pns:
 			p = self.rpaths[k]
@@ -1462,6 +1470,7 @@ class FlickrSync:
 
 		self.sync_files(sfiles)
 		self.up_to_date()
+		uprint("--------------------------------------------------------------------------------")
 		uinfo("DROP Completed!")
 
 
@@ -1512,6 +1521,7 @@ def help():
 	print("    pull [go] [force]   download remote files")
 	print("      [force]           force to update file whose size is different")
 	print("                        force to trash file that not exists in remote")
+	print("      [go]              no confirm (always yes)")
 	print("    push [go] [force]   upload local files")
 	print("      [force]           force to update file whose size is different")
 	print("                        force to trash file that not exists in local")
