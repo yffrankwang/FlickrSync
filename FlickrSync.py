@@ -1212,12 +1212,11 @@ class FlickrSync:
 		return lf
 
 	def create_local_dirs(self, lf):
-		np = file.npath
-		if os.path.exists(np):
+		if os.path.exists(lf.npath):
 			return
 
 		uinfo("%s >CREATE> %s" % (self.prog(), lf.title))
-		os.makedirs(np)
+		os.makedirs(lf.npath)
 
 	def trash_local_file(self, lf):
 		if config.trash_dir:
