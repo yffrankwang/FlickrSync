@@ -198,7 +198,7 @@ class Config:
 		self.fileexts = self.get('fileexts', 'jpeg jpg gif png tiff avi mov m4v mp4 wmv').split()
 
 		# tag split
-		self.tag_split_re = self.get('tag_split_re', r'[\\/ ]')
+		self.tag_split_re = self.get('tag_split_re', r'[\\/ ,\_\-.;:]')
 
 		#Kodak cam EXIF tag  keyword
 		self.exif_tag_keywords = self.get('exif_tag_keywords', 'Image XPKeywords')
