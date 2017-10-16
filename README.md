@@ -9,7 +9,7 @@ Flickr Synchronize Command Line Tool.
 
 Install dependencies
 
-    pip install --upgrade pytz tzlocal python-dateutil exifread 
+    pip install --upgrade tzlocal python-dateutil oauth2
 
 On Windows, download and install [pwin32](https://sourceforge.net/projects/pywin32/).
 

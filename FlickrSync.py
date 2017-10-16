@@ -6,8 +6,6 @@ FlickrSync
 Sync files in local directory to Flickr.
 '''
 import codecs
-import cStringIO
-import json
 import math
 import fnmatch
 import sys
@@ -17,43 +15,102 @@ import shutil
 import logging
 import datetime
 import time
-import pytz, tzlocal
+import tzlocal
 import dateutil.parser
-import mimetools
+import random
 import mimetypes
-import Queue
 import threading
 import traceback
-import urllib2
+import urllib
 import webbrowser
 import unicodedata
-from xml.dom import minidom
-import exifread
-import flickr
+import json
 import FileLock
+from io import BytesIO
+import httplib2
+import oauth2 as oauth
+
+try:
+	from urlparse import parse_qsl
+except ImportError:
+	from cgi import parse_qsl
 
 try:
 	from ConfigParser import ConfigParser
 except Exception:
 	from configparser import ConfigParser
 
-LTZ = tzlocal.get_localzone()
-SENC = sys.getdefaultencoding()
-FENC = sys.getfilesystemencoding()
-DT1970 = datetime.datetime.fromtimestamp(0)
-LOG = None
-
+# We need to import a XML Parser because Flickr doesn't return JSON for photo uploads -_-
+try:
+	from lxml import etree
+except ImportError:
+	try:
+		# Python 2.5
+		import xml.etree.cElementTree as etree
+	except ImportError:
+		try:
+			# Python 2.5
+			import xml.etree.ElementTree as etree
+		except ImportError:
+			try:
+				#normal cElementTree install
+				import cElementTree as etree
+			except ImportError:
+				try:
+					# normal ElementTree install
+					import elementtree.ElementTree as etree
+				except ImportError:
+					raise ImportError('Failed to import ElementTree from any known place')
 
 if sys.version_info >= (3, 0):
+	import queue
+	def urlopen(u):
+		return urllib.request.urlopen(u)
+	def urlquote(u):
+		return urllib.parse.quote(u)
+	def urlencode(u):
+		return urllib.parse.urlencode(u)
 	def unicode(s):
 		return str(s)
 	def raw_input(s):
 		return input(s)
+else:
+	import Queue
+	queue = Queue
+	
+	import urllib2
+	def urlopen(u):
+		return urllib2.urlopen(u)
+	def urlquote(u):
+		return urllib.quote(u)
+	def urlencode(u):
+		return urllib.urlencode(u)
 
+try:
+	# Python 2.6-2.7 
+	from HTMLParser import HTMLParser
+except ImportError:
+	# Python 3
+	from html.parser import HTMLParser
+
+#------------------------------------------------
+LOG = None
+HP = HTMLParser()
+UTF8 = codecs.lookup('utf-8')[3]
+LTZ = tzlocal.get_localzone()
+SENC = sys.getdefaultencoding()
+FENC = sys.getfilesystemencoding()
+DT1970 = datetime.datetime.fromtimestamp(0)
+LOCK = threading.Lock()
+
+# init
+mimetypes.init()
+
+
+#------------------------------------------------
 def normpath(s):
 	return unicodedata.normalize('NFC', s)
 
-LOCK = threading.Lock()
 def uprint(s):
 	with LOCK:
 		try:
@@ -135,26 +192,38 @@ def trimdir(p):
 	return unicode(p)
 
 
-class APIConstants:
-	base = "https://flickr.com/services/"
-	rest   = base + "rest/"
-	auth   = base + "auth/"
-	upload = "https://up.flickr.com/services/upload/"
-	update = "https://up.flickr.com/services/replace/"
+def get_content_type(filename):
+	return mimetypes.guess_type(filename)[0] or 'application/octet-stream'
 
-	token = "auth_token"
-	secret = "secret"
-	key = "api_key"
-	sig = "api_sig"
-	frob = "frob"
-	perms = "perms"
-	method = "method"
 
-	def __init__( self ):
-		pass
+def iter_fields(fields):
+	"""Iterate over fields.
+		Supports list of (k, v) tuples and dicts.
+	"""
+	if isinstance(fields, dict):
+		return ((k, v) for k, v in fields.iteritems())
+	return ((k, v) for k, v in fields)
 
+
+def get_json_item(o):
+	if o:
+		if isinstance(o, dict):
+			o = o.get('_content');
+		if o:
+			o = HP.unescape(o)
+	return o
+
+
+def print_progress(page, pages):
+	if pages == 0:
+		page = 0
+	sys.stdout.write("\b\b\b\b\b\b\b%3d/%-3d" % (page, pages))
+	sys.stdout.flush()
+
+
+#---------------------------------------------------------------
 class Config:
-	"""Singleton style/static initialisation wrapper thing"""
+	"""Singleton style/static initialization wrapper thing"""
 	def __init__(self):
 		self.dict = ConfigParser()
 		paths = (os.path.abspath('.flickrsync.ini'), os.path.expanduser('~/.flickrsync.ini'))
@@ -180,7 +249,7 @@ class Config:
 		if self.trash_dir:
 			self.trash_dir = trimdir(os.path.abspath(self.trash_dir))
 
-		# user webbrowser
+		# user web browser
 		self.webbrowser = True if self.get('webbrowser', 'true') == 'true' else False 
 
 		# max_file_size (1GB)
@@ -199,9 +268,6 @@ class Config:
 
 		# tag split
 		self.tag_split_re = self.get('tag_split_re', r'[\\/ ,\_\-.;:]')
-
-		#Kodak cam EXIF tag  keyword
-		self.exif_tag_keywords = self.get('exif_tag_keywords', 'Image XPKeywords')
 
 		# keys
 		self.secret = self.get('secret', 'bba29b1d2de7b850')
@@ -234,52 +300,450 @@ class Config:
 # global config
 config = Config()
 
-# init
-mimetypes.init()
+#-------------------------------------------------------------------
+class FlickrAPIError(Exception):
+	""" Generic error class, catch-all for most Tumblpy issues.
+		from Tumblpy import FlickrAPIError, FlickrAuthError
+	"""
+	def __init__(self, msg, error_code=None):
+		self.msg = msg
+		self.code = error_code
+		if error_code is not None and error_code < 100:
+			raise FlickrAuthError(msg, error_code)
 
-# global api constats
-api = APIConstants()
+	def __str__(self):
+		return repr(self.msg)
 
-class FlickrService:
-	def __init__(self):
-		flickr.API_KEY = config.api_key
-		flickr.API_SECRET = config.secret
-		flickr.AUTH = True
 
-		self.path = os.path.abspath(config.token_file)
-		self.file = None
+class FlickrAuthError(FlickrAPIError):
+	""" Raised when you try to access a protected resource and it fails due to some issue with your authentication. """
+	def __init__(self, msg, error_code=None):
+		self.msg = msg
+		self.code = error_code
+
+	def __str__(self):
+		return repr(self.msg)
+
+
+class FlickrAPI(object):
+	def __init__(self, api_key=None, api_secret=None, oauth_token=None, oauth_token_secret=None, callback_url=None, headers=None, client_args=None):
+		if not api_key or not api_secret:
+			raise FlickrAPIError('Please supply an api_key and api_secret.')
+
+		self.api_key = api_key
+		self.api_secret = api_secret
+		self.callback_url = callback_url
+
+		self.api_base = 'https://api.flickr.com/services'
+		self.up_api_base = 'https://up.flickr.com/services'
+		self.rest_api_url = '%s/rest' % self.api_base
+		self.upload_api_url = '%s/upload/' % self.up_api_base
+		self.replace_api_url = '%s/replace/' % self.up_api_base
+		self.request_token_url = 'https://www.flickr.com/services/oauth/request_token'
+		self.access_token_url = 'https://www.flickr.com/services/oauth/access_token'
+		self.authorize_url = 'https://www.flickr.com/services/oauth/authorize'
+
+		self.headers = headers
+		if self.headers is None:
+			self.headers = {'User-agent': 'PythonFlickrSync'}
+
+		self.oauth_token = None
+		self.oauth_token_secret = None
+		self.consumer = None
 		self.token = None
+		
+		self.set_oauth_token(oauth_token, oauth_token_secret, client_args)
+
+
+	def set_oauth_token(self, oauth_token, oauth_token_secret, client_args=None):
+		self.oauth_token = oauth_token
+		self.oauth_token_secret = oauth_token_secret
+		self.client_args = client_args or {}
+
+		if self.api_key is not None and self.api_secret is not None:
+			self.consumer = oauth.Consumer(self.api_key, self.api_secret)
+
+		if self.oauth_token is not None and self.oauth_token_secret is not None:
+			self.token = oauth.Token(oauth_token, oauth_token_secret)
+
+	def get_http(self):
+		# Filter down through the possibilities here - if they have a token, if they're first stage, etc.
+		if self.consumer is not None and self.token is not None:
+			return oauth.Client(self.consumer, self.token, **self.client_args)
+		elif self.consumer is not None:
+			return oauth.Client(self.consumer, **self.client_args)
+		else:
+			# If they don't do authentication, but still want to request unprotected resources, we need an opener.
+			return httplib2.Http(**self.client_args)
+		
+	def get_authentication_tokens(self, perms=None):
+		""" Returns an authorization url to give to your user.
+
+			Parameters:
+			perms - If None, this is ignored and uses your applications default perms. If set, will overwrite applications perms; acceptable perms (read, write, delete)
+						* read - permission to read private information
+						* write - permission to add, edit and delete photo metadata (includes 'read')
+						* delete - permission to delete photos (includes 'write' and 'read')
+		"""
+
+		request_args = {}
+		resp, content = self.get_http().request('%s?oauth_callback=%s' % (self.request_token_url, self.callback_url), 'GET', **request_args)
+
+		if resp['status'] != '200':
+			raise FlickrAuthError('There was a problem retrieving an authentication url.')
+
+		request_tokens = parse_qsl(content)
+		request_tokens = dict(request_tokens)
+
+		auth_url_params = {
+			'oauth_token': request_tokens[b'oauth_token']
+		}
+
+		accepted_perms = ('read', 'write', 'delete')
+		if perms and perms in accepted_perms:
+			auth_url_params['perms'] = perms
+
+		request_tokens['auth_url'] = '%s?%s' % (self.authorize_url, urlencode(auth_url_params))
+		return request_tokens
+
+	def get_auth_tokens(self, oauth_verifier):
+		""" Returns 'final' tokens to store and used to make authorized calls to Flickr.
+
+			Parameters:
+				oauth_token - oauth_token returned from when the user is redirected after hitting the get_auth_url() function
+				verifier - oauth_verifier returned from when the user is redirected after hitting the get_auth_url() function
+		"""
+
+		params = {
+			'oauth_verifier': oauth_verifier,
+		}
+
+		resp, content = self.get_http().request('%s?%s' % (self.access_token_url, urlencode(params)), 'GET')
+		if resp['status'] != '200':
+			raise FlickrAuthError('Getting access tokens failed: %s Response Status' % resp['status'])
+
+		return dict(parse_qsl(content))
+
+	def _convert_params(self, params):
+		"""Convert lists to strings with ',' between items."""
+		for (key, value) in params.items():
+			if isinstance(value, (int, long)):
+				params[key] = str(value)
+			elif urllib._is_unicode(value):
+				params[key] = value.encode('UTF-8')
+			elif isinstance(value, list):
+				params[key] = ','.join([item for item in value])
+
+	def api_request(self, endpoint=None, method='GET', params={}, files=None, replace=False):
+		headers = {}
+		headers.update(self.headers)
+		headers.update({'Content-Type': 'application/json'})
+		headers.update({'Content-Length': '0'})
+
+		if endpoint is None and files is None:
+			raise FlickrAPIError('Please supply an API endpoint to hit.')
+
+		qs = {
+			'format': 'json',
+			'nojsoncallback': 1,
+			'method': endpoint,
+			'api_key': self.api_key
+		}
+		self._convert_params(params)
+		
+		if method == 'POST':
+			if files is not None:
+				# To upload/replace file, we need to create a fake request
+				# to sign parameters that are not multipart before we add
+				# the multipart file to the parameters...
+				# OAuth is not meant to sign multipart post data
+				http_url = self.replace_api_url if replace else self.upload_api_url
+				faux_req = oauth.Request.from_consumer_and_token(self.consumer,
+																 token=self.token,
+																 http_method="POST",
+																 http_url=http_url,
+																 parameters=params)
+
+				faux_req.sign_request(oauth.SignatureMethod_HMAC_SHA1(),
+									  self.consumer,
+									  self.token)
+
+				all_upload_params = dict(parse_qsl(faux_req.to_postdata()))
+
+				# For Tumblr, all media (photos, videos)
+				# are sent with the 'data' parameter
+				all_upload_params['photo'] = (files.name, files.read())
+				body, content_type = self.encode_multipart_formdata(all_upload_params)
+
+				headers.update({
+					'Content-Type': content_type,
+					'Content-Length': str(len(body))
+				})
+
+				req = urllib2.Request(http_url, body, headers)
+				try:
+					req = urlopen(req)
+				except Exception as e:
+					# Making a fake resp var because urllib2.urlopen doesn't
+					# return a tuple like OAuth2 client.request does
+					resp = {'status': e.code}
+					content = e.read()
+
+				# If no error, assume response was 200
+				resp = {'status': 200}
+
+				content = req.read()
+				content = etree.XML(content)
+
+				stat = content.get('stat') or 'ok'
+
+				if stat == 'fail':
+					if content.find('.//err') is not None:
+						code = content.findall('.//err[@code]')
+						msg = content.findall('.//err[@msg]')
+
+						if len(code) > 0:
+							if len(msg) == 0:
+								msg = 'An error occurred making your Flickr API request.'
+							else:
+								msg = msg[0].get('msg')
+
+							code = int(code[0].get('code'))
+
+							content = {
+								'stat': 'fail',
+								'code': code,
+								'message': msg
+							}
+				else:
+					photoid = content.find('.//photoid')
+					if photoid is not None:
+						photoid = photoid.text
+
+					content = {
+						'stat': 'ok',
+						'photoid': photoid
+					}
+
+			else:
+				url = self.rest_api_url + '?' + urlencode(qs) + '&' + urlencode(params)
+				resp, content = self.get_http().request(url, 'POST', headers=headers)
+		else:
+			params.update(qs)
+			url = '%s?%s' % (self.rest_api_url, urlencode(params))
+			resp, content = self.get_http().request(url, 'GET', headers=headers)
+
+		status = int(resp['status'])
+		if status < 200 or status >= 300:
+			raise FlickrAPIError('Flickr returned a Non-200 response.', error_code=status)
+
+		#try except for if content is able to be decoded
+		try:
+			if type(content) != dict:
+				content = json.loads(content)
+		except ValueError:
+			raise FlickrAPIError('Content is not valid JSON, unable to be decoded.')
+
+		if content.get('stat') and content['stat'] == 'fail':
+			raise FlickrAPIError('Flickr returned error code: %d. Message: %s' % \
+								(content['code'], content['message']),
+								error_code=content['code'])
+
+		return dict(content)
+
+	def get(self, endpoint=None, params=None):
+		params = params or {}
+		return self.api_request(endpoint, method='GET', params=params)
+
+	def post(self, endpoint=None, params=None, files=None, replace=False):
+		params = params or {}
+		return self.api_request(endpoint, method='POST', params=params, files=files, replace=replace)
+
+	# Thanks urllib3 <3
+	def encode_multipart_formdata(self, fields, boundary=None):
+		"""
+		Encode a dictionary of ``fields`` using the multipart/form-data mime format.
+
+		:param fields:
+			Dictionary of fields or list of (key, value) field tuples.  The key is
+			treated as the field name, and the value as the body of the form-data
+			bytes. If the value is a tuple of two elements, then the first element
+			is treated as the filename of the form-data section.
+
+			Field names and filenames must be unicode.
+
+		:param boundary:
+			If not specified, then a random boundary will be generated using
+			:func:`mimetools.choose_boundary`.
+		"""
+		body = BytesIO()
+		if boundary is None:
+			boundary = str(random.random()) + '_' + str(random.random())
+
+		for fieldname, value in iter_fields(fields):
+			body.write('--%s\r\n' % (boundary))
+
+			if isinstance(value, tuple):
+				filename, data = value
+				UTF8(body).write('Content-Disposition: form-data; name="%s"; '
+								   'filename="%s"\r\n' % (fieldname, filename))
+				body.write('Content-Type: %s\r\n\r\n' %
+						   (get_content_type(filename)))
+			else:
+				data = value
+				UTF8(body).write('Content-Disposition: form-data; name="%s"\r\n'
+								   % (fieldname))
+				body.write(b'Content-Type: text/plain\r\n\r\n')
+
+			if isinstance(data, int):
+				data = str(data)  # Backwards compatibility
+
+			if isinstance(data, unicode):
+				UTF8(body).write(data)
+			else:
+				body.write(data)
+
+			body.write(b'\r\n')
+
+		body.write('--%s--\r\n' % (boundary))
+
+		content_type = 'multipart/form-data; boundary=%s' % boundary
+
+		return body.getvalue(), content_type
+
+
+#------------------------------------------------------
+class FAlbum:
+	def __init__(self, a):
+		self.id = a.get('id')
+		self.title = get_json_item(a.get('title'))
+		self.description= get_json_item(a.get('description'))
+		self.items = int(a.get('photos', '0')) + int(a.get('videos', 0))
+
+class FPhoto:
+	def __init__(self, p=None):
+		self.id = None
+		self.title = None
+		self.url = None
+		self.path = None
+		self.npath = None
+		self.fsize = None
+		self.mdate = DT1970
+		self.fsize = -1
+		self.parent = None
+		self.action = ''
+		self.reason = ''
+		self.description = ''
+		self.tags = ''
+		self.video = False
+
+		if p:
+			self.id = p['id']
+			self.title = p['title']
+			self.url = p.get('url_o')
+			self.tags = p.get('tags', '')
+			self.description = get_json_item(p.get('description'))
+
+			m = p.get('media_o', '')
+			if m == "video":
+				self.video = True
+
+			if not self.title:
+				self.title = self.id
+			if self.title and self.title[0] != '/':
+				self.title = '/' + self.title
+			self.npath = os.path.abspath(config.root_dir + self.title)
+	
+			if self.description:
+				try:
+					a = json.loads(self.description)
+					self.fsize = a['fsize']
+					self.mdate = todate(a['mdate'])
+				except Exception as e:
+					uwarn('Invalid description: %s - %s' % (self.description, str(e)))
+
+
+class FlickrClient:
+	def __init__(self):
+		self.path = os.path.abspath(config.token_file)
+		self.cred = None
+		self.fapi = None
+		self.user = None
 		self.perms = ""
+		
 		uinfo('Check user token ...')
 		
-		self._load_token()
-		if not self._check_token():
-			self._authenticate()
+		self._load_credentials()
+		if not self.user:
+			uinfo("Credentials not found, begin the OAuth process.")
+			self._init_credentials()
 
 		try:
-			self._lock_token()
-		except Exception, e:
+			self._lock_credentials()
+		except Exception as e:
 			uerror(str(e))
 			raise Exception('Failed to lock %s' % self.path)
 
-		self.user = flickr.test_login()
-		uinfo("User ID: %s" % self.user.id)
+		uinfo("User ID: %s" % self.user['id'])
 	
-	"""
-	Signs args via md5 per Section 8 of
-	http://www.flickr.com/services/api/auth.spec.html
-	"""
-	def _sign_call(self, data):
-		flickr._convert_params(data)
-		return flickr._sign_call(data)
+	def _load_credentials(self):
+		if os.path.exists(self.path):
+			with open(self.path) as f:
+				try:
+					self.cred = f.read()
+					self.cred = json.loads(self.cred)
+				except Exception as e:
+					self.cred = None
+					uwarn("Failed to load credentials: " + str(e));
+					return
+			
+			self.fapi = FlickrAPI(api_key=config.api_key, 
+								api_secret=config.secret, 
+								oauth_token=self.cred['oauth_token'], 
+								oauth_token_secret=self.cred['oauth_token_secret'])
+			self._test_login()
 
-	"""
-	Creates the url from the template
-	base/?key=value...&api_key=key&api_sig=sig
-	"""
-	def _url_gen(self, base, data):
-		flickr._convert_params(data)
-		return flickr._url_gen(base, data)
+	def _save_credentials(self):
+		with open(self.path, 'w') as f:
+			cred = json.dumps(self.cred)
+			f.write(cred)
+
+		touch(self.path, config.last_sync)
+
+	def _lock_credentials(self):
+		FileLock.lock(open(self.path))
+
+	def _init_credentials(self):
+		self.fapi = FlickrAPI(api_key=config.api_key, api_secret=config.secret, callback_url="https://localhost")
+
+		self.cred = self.fapi.get_authentication_tokens(perms='delete')
+		auth_url = self.cred['auth_url']
+
+		uprint('Paste this URL into your browser, approve the app\'s access.')
+		uprint('Copy everything in the address bar after "oauth_verifier=", and paste it below.')
+		uprint(auth_url)
+		if config.webbrowser:
+			webbrowser.open(auth_url)
+		
+		code = raw_input('Paste oauth_verifier here: ')
+		if not code:
+			print("You need to allow this program to access your Flickr site.")
+			print("A web browser should pop open with instructions.")
+			print("After you have allowed access restart FlickrSync.py")
+			sys.exit()
+
+		self.fapi.set_oauth_token(self.cred['oauth_token'], self.cred['oauth_token_secret'])
+
+		self.cred = self.fapi.get_auth_tokens(code)
+		
+		self._save_credentials()
+		
+		self.fapi.set_oauth_token(self.cred['oauth_token'], self.cred['oauth_token_secret'])
+		
+		self._test_login()
+
+	def _test_login(self):
+		self.user = self.fapi.get('flickr.test.login')['user']
 
 	"""
 	Returns True if the response was OK.
@@ -296,6 +760,7 @@ class FlickrService:
 		except AttributeError:
 			err = "Error: " + str( res )
 		uerror(err)
+		return err
 
 	"""
 	Send the url and get a response.  Let errors float up
@@ -305,11 +770,11 @@ class FlickrService:
 		while True:
 			try:
 				cnt += 1
-				res = urllib2.urlopen(url)
+				res = urlopen(url)
 				data = res.read()
 				res.close()
 				return data
-			except Exception, e:
+			except Exception as e:
 				if cnt <= config.max_retry:
 					uwarn(str(e))
 					uwarn("Failed to get %s, retry %d" % (url, cnt))
@@ -319,214 +784,6 @@ class FlickrService:
 					uexception(e)
 					raise
 
-	"""
-	Send the url and get a xml.  Let errors float up
-	"""
-	def _get_xml(self, url):
-		data = self._get_data(url)
-		xml = flickr.unmarshal(minidom.parse(cStringIO.StringIO(data)))
-		return xml.rsp
-
-	#
-	# buildRequest/encodeMultipartFormdata code is from
-	# http://www.voidspace.org.uk/atlantibots/pythonutils.html
-	#
-	def _build_request(self, theurl, fields, files, txheaders=None):
-		"""
-		Given the fields to set and the files to encode it returns a fully formed urllib2.Request object.
-		You can optionally pass in additional headers to encode into the opject. (Content-type and Content-length will be overridden if they are set).
-		fields is a sequence of (name, value) elements for regular form fields - or a dictionary.
-		files is a sequence of (name, filename, value) elements for data to be uploaded as files.
-		"""
-		content_type, body = self._encodeMultipartFormdata(fields, files)
-		if not txheaders: txheaders = {}
-		txheaders['Content-type'] = content_type
-		txheaders['Content-length'] = str(len(body))
-
-		return urllib2.Request(theurl, body, txheaders)
-
-	def _encodeMultipartFormdata(self, fields, files, boundary = '-----'+mimetools.choose_boundary()+'-----'):
-		""" Encodes fields and files for uploading.
-		fields is a sequence of (name, value) elements for regular form fields - or a dictionary.
-		files is a sequence of (name, filename, value) elements for data to be uploaded as files.
-		Return (content_type, body) ready for urllib2.Request instance
-		You can optionally pass in a boundary string to use or we'll let mimetools provide one.
-		"""
-		crlf = '\r\n'
-		L = []
-		if isinstance(fields, dict):
-			fields = fields.items()
-		for (key, value) in fields:
-			L.append('--' + boundary)
-			L.append('Content-Disposition: form-data; name="%s"' % key)
-			L.append('')
-			L.append(value)
-		for (key, filename, value) in files:
-			filetype = mimetypes.guess_type(filename)[0] or 'application/octet-stream'
-			L.append('--' + boundary)
-			L.append('Content-Disposition: form-data; name="%s"; filename="%s"' % (key, filename))
-			L.append('Content-Type: %s' % filetype)
-			L.append('')
-			L.append(value)
-		L.append('--' + boundary + '--')
-		L.append('')
-		body = crlf.join(L)
-		content_type = 'multipart/form-data; boundary=%s' % boundary
-		return content_type, body
-
-
-	"""
-	flickr.auth.getFrob
-
-	Returns a frob to be used during authentication. This method call must be
-	signed.
-
-	This method does not require authentication.
-	Arguments
-
-	api.key (Required)
-	Your API application key. See here for more details.
-	"""
-	def _getFrob( self ):
-		d = {
-			api.method  : "flickr.auth.getFrob"
-			}
-		url = self._url_gen(api.rest, d)
-		try:
-			response = self._get_xml(url)
-			if self._is_good(response):
-				return str(response.frob.text)
-			else:
-				raise Exception("Failed to get frob")
-		except Exception, e:
-			uerror("Error getting frob: %s" % str(sys.exc_info()))
-			uexception(e)
-			raise
-
-	"""
-	Checks to see if the user has authenticated this application
-	"""
-	def _authByUser(self, frob):
-		d =  {
-			api.frob : frob,
-			api.perms : "delete"
-			}
-		url = self._url_gen(api.auth, d)
-
-		print("Please authenticate this app with this url: \n%s" % url)
-		if config.webbrowser:
-			webbrowser.open( url )
-
-		ans = raw_input("Have you authenticated this application? (Y/N): ")
-		if ( ans.lower() != "y" ):
-			print "You need to allow this program to access your Flickr site."
-			print "A web browser should pop open with instructions."
-			print "After you have allowed access restart uploadr.py"
-			sys.exit()
-
-	"""
-	http://www.flickr.com/services/api/flickr.auth.getToken.html
-
-	flickr.auth.getToken
-
-	Returns the auth token for the given frob, if one has been attached. This method call must be signed.
-	Authentication
-
-	This method does not require authentication.
-	Arguments
-
-	NTC: We need to store the token in a file so we can get it and then check it insted of
-	getting a new on all the time.
-
-	api.key (Required)
-	   Your API application key. See here for more details.
-	frob (Required)
-	   The frob to check.
-	"""
-	def _authenticate( self ):
-		frob = self._getFrob()
-		self._authByUser(frob)
-		d = {
-			api.method : "flickr.auth.getToken",
-			api.frob : frob
-		}
-
-		url = self._url_gen(api.rest, d)
-		try:
-			res = self._get_xml(url)
-			if self._is_good(res):
-				self.token = str(res.auth.token.text)
-				flickr.USER_TOKEN = self.token
-				self.perms = str(res.auth.perms.text)
-				self._save_token()
-			else:
-				self._report_error(res)
-		except Exception, e:
-			uerror("Failed to get token")
-			uexception(e)
-			raise
-
-	"""
-	flickr.auth.checkToken
-
-	Returns the credentials attached to an authentication token.
-	Authentication
-
-	This method does not require authentication.
-	Arguments
-
-	api.key (Required)
-		Your API application key. See here for more details.
-	auth_token (Required)
-		The authentication token to check.
-	"""
-	def _check_token( self ):
-		if self.token is None:
-			return False
-		
-		d = {
-			api.token  :  str(self.token) ,
-			api.method :  "flickr.auth.checkToken"
-		}
-		url = self._url_gen(api.rest, d)
-		try:
-			res = self._get_xml(url)
-			if self._is_good(res):
-				self.token = str(res.auth.token.text)
-				self.perms = str(res.auth.perms.text)
-				return True
-
-			self._report_error(res)
-			return False
-		except Exception, e:
-			logging.error("Failed to checkToken");
-			logging.exception(e)
-			raise
-
-	"""
-	Attempts to get the flickr token from disk.
-	"""
-	def _load_token( self ):
-		self.token = None
-		if os.path.exists(config.token_file):
-			self.file = open(config.token_file)
-			self.token = self.file.read()
-			flickr.USER_TOKEN = self.token
-
-	def _save_token( self ):
-		try:
-			if self.file:
-				self.file.close()
-			self.file = open(config.token_file, 'w')
-			self.file.write(str(self.token))
-			touch(self.path, config.last_sync)
-		except Exception, e:
-			uerror("Failed to save token to local cache: %s" % self.token)
-			uexception(e)
-			raise
-
-	def _lock_token(self):
-		FileLock.lock(self.file)
 
 	def _exea(self, api, msg):
 		cnt = 0
@@ -544,82 +801,168 @@ class FlickrService:
 					uexception(e)
 					raise
 
+	def setPhotoMeta(self, photo, title=None, description=None):
+		method = 'flickr.photos.setMeta'
+		
+		d = { 'photo_id': photo.id }
+		if title:
+			d['title'] = title
+		if description:
+			d['description'] = description
+
+		self.fapi.post(method, params=d)
+		return True
+
+	def setPhotoTags(self, photo, tags):
+		method = 'flickr.photos.setTags'
+		d = { 'photo_id': photo.id, 'tags': tags }
+		self.fapi.post(method, params=d)
+		return True
+	
+	def deletePhoto(self, photo):
+		method = 'flickr.photos.delete'
+		self.fapi.post(method, params={ 'photo_id': photo.id })
+	
+	def getPhotoURL(self, photo, item, prop):
+		method = 'flickr.photos.getSizes'
+		data = self.fapi.post(method, params={ 'photo_id': photo.id })
+		sizes = data.get('sizes')
+		if sizes:
+			size = sizes.get('size')
+			if size:
+				for psize in data.sizes.size:
+					if psize.label == item:
+						return getattr(psize, prop)
+		return None
+
+	def addAlbumPhotos(self, album, photos):
+		method = 'flickr.photosets.editPhotos'
+
+		ids = [photo.id for photo in photos]
+
+		self.fapi.post(method, params={ 
+				'photoset_id': album.id,
+				'primary_photo_id': ids[0],
+				'photo_ids': ids })
+
+		album.items = len(photos)
+	
+	def newAlbum(self, photo, title, description):
+		method = 'flickr.photosets.create'
+		data = self.fapi.post(method, params={ 
+				'title': title,
+				'description': description,
+				'primary_photo_id': photo.id })
+
+		a = data.get('photoset')
+		if not a:
+			return None
+		
+		return FAlbum(a)
+	
+	def deleteAlbum(self, album):
+		method = 'flickr.photosets.delete'
+		self.fapi.post(method, params={ 'photoset_id': album.id })
+
+	def getAlbums(self, page=1):
+		method = 'flickr.photosets.getList'
+
+		sets = []
+		params = { 'user_id': self.user['id'], 'page': page, 'per_page': 500 }
+			
+		data = self.fapi.post(method, params=params)
+
+		photosets = data['photosets']
+		pages = int(photosets['pages'])
+
+		photoset = photosets['photoset']
+		if not photoset:
+			return (sets, 0)
+		
+		if isinstance(photoset, list):
+			for ps in photoset:
+				sets.append(FAlbum(ps))
+		else:
+			ps = photoset
+			sets.append(FAlbum(ps))
+
+		return (sets, pages)
+
+	def getPhotos(self, sid=None, page=1):
+		method = 'flickr.photosets.getPhotos' if sid else 'flickr.people.getPhotos'
+
+		sets = []
+		params = { 'user_id': self.user['id'], 
+					'extras': "description, media, tags, url_o", 
+					'page': page, 'per_page': 500 }
+		if sid:
+			params['photoset_id'] = sid
+			
+		data = self.fapi.post(method, params=params)
+
+		photos = data[ 'photoset' if sid else 'photos' ]
+		pages = int(photos['pages'])
+
+		photol = photos['photo']
+		if not photol:
+			return (sets, pages)
+		
+		if isinstance(photol, list):
+			for photo in photol:
+				sets.append(FPhoto(photo))
+		else:
+			photo = photol
+			sets.append(FPhoto(photo))
+
+		return (sets, pages)
+
 	def download(self, url, npath):
 		data = self._get_data(url)
 		with open(npath, "wb") as f:
 			f.write(data)
 
-	def upload(self, photo):
-		with open(photo.npath, 'rb') as f:
-			data = f.read()
-
+	def uploadPhoto(self, photo):
 		photo.ispublic = str(config.public)
 		photo.isfriend = str(config.friend)
 		photo.isfamily = str(config.family)
+		photo.ishidden = str(config.hidden)
 
 		meta = { 'fsize': photo.fsize, 'mdate': mtstr(photo.mdate) }
 		photo.description = json.dumps(meta)
 
-		p = ('photo', urllib2.quote(photo.title.encode('utf8')), data)
-		d = {
-			api.token    : self.token,
-			api.perms    : self.perms,
-			"title"      : photo.title,
-			"description": photo.description,
-			"tags"	     : photo.tags,
-			"hidden"	 : str(config.hidden),
-			"is_public"  : photo.ispublic,
-			"is_friend"  : photo.isfriend,
-			"is_family"  : photo.isfamily
-		}
-		sig = self._sign_call(d)
-		d[ api.sig ] = sig
-		d[ api.key ] = config.api_key
-
-		req = self._build_request(api.upload, d, (p,))
-		res = self._get_xml(req)
-		if self._is_good(res):
-			photoid = str(res.photoid.text)
-			return photoid
-		else:
-			self._report_error(res)
-			return None
-
-	def update(self, photo):
 		with open(photo.npath, 'rb') as f:
-			data = f.read()
+			d = {
+				"title"      : photo.title,
+				"description": photo.description,
+				"tags"       : photo.tags,
+				"hidden"     : photo.ishidden,
+				"is_public"  : photo.ispublic,
+				"is_friend"  : photo.isfriend,
+				"is_family"  : photo.isfamily
+			}
+	
+			r = self.fapi.post(params=d, files=f)
+			return r['photoid']
 
-		meta = { 'fsize': photo.fsize, 'mdate': mtstr(photo.mdate) }
-		photo.description = json.dumps(meta)
-
-		p = ('photo', urllib2.quote(photo.title.encode('utf8')), data)
-		d = {
-			api.token    : self.token,
-			api.perms    : self.perms
-		}
-		sig = self._sign_call(d)
-		d[ api.sig ] = sig
-		d[ api.key ] = config.api_key
-
-		req = self._build_request(api.update, d, (p,))
-		res = self._get_xml(req)
-		if self._is_good(res):
-			photoid = str(res.photoid.text)
-			photo.setMeta()
-			return photoid
-		else:
-			self._report_error(res)
-			return None
+	def updatePhoto(self, rf, lf):
+		with open(lf.npath, 'rb') as f:
+			pid = self.fapi.post(params={ 'photo_id': rf.id }, files=f, replace=True)
+			if pid:
+				meta = { 'fsize': lf.fsize, 'mdate': mtstr(lf.mdate) }
+				lf.description = json.dumps(meta)
+				self.setPhotoMeta(rf, description=lf.description)
+				if lf.tags and lf.tags != rf.tags:
+					self.setPhotoTags(rf, lf.tags)
+				return pid
+		return None
 
 class FlickrSync:
-	def __init__(self, service):
-		'''
-		:param service: The service of flickr.test_login.
-		'''
-		self.service = service
+	def __init__(self, client):
+		self.client = client
 		self.rfiles = {}
 		self.rpaths = {}
 		self.albums = {}
+		self.photos = [] #used by threads
 
 		self.abandon = False
 		self.syncQueue = None
@@ -630,32 +973,35 @@ class FlickrSync:
 	def print_albums(self, albums):
 		uprint("--------------------------------------------------------------------------------")
 
-		tz = 0
-		lp = ''
+		p = 0
 		ks = list(albums.keys())
 		ks.sort()
 		for n in ks:
 			a = albums[n]
-			uprint(u"  [%4d] %s" % (len(a), a.title))
+			p += a.items
+			uprint(u"  [%4d] %s" % (a.items, a.title))
 
 		uprint("--------------------------------------------------------------------------------")
-		uprint("Total %d albums" % (len(albums)))
-
+		uprint("Total %s albums, %s photos" % (szstr(len(albums)), szstr(p)))
 
 	def print_photos(self, photos, url = False):
 		uprint("--------------------------------------------------------------------------------")
 
 		tz = 0
-		ks = list(photos.keys())
-		ks.sort()
-		for n in ks:
-			p = photos[n]
-
-			tz += p.fsize
-			uprint(u"  %-40s [%11s] (%s) %s" % (p.title, szstr(p.fsize), tmstr(p.mdate), ("" if (not url) or (not p.url) else p.url)))
+		if isinstance(photos, dict):
+			ks = list(photos.keys())
+			ks.sort()
+			for n in ks:
+				p = photos[n]
+				tz += p.fsize
+				uprint(u"  %-40s [%11s] (%s) %s" % (p.title, szstr(p.fsize), tmstr(p.mdate), ("" if (not url) or (not p.url) else p.url)))
+		else:
+			for p in photos:
+				tz += p.fsize
+				uprint(u"  %-40s [%11s] (%s) %s" % (p.title, szstr(p.fsize), tmstr(p.mdate), ("" if (not url) or (not p.url) else p.url)))
 
 		uprint("--------------------------------------------------------------------------------")
-		uprint("Total %d photos [%s]" % (len(photos), szstr(tz)))
+		uprint("Total %s photos [%s]" % (szstr(len(photos)), szstr(tz)))
 
 
 	def print_updates(self, photos):
@@ -675,62 +1021,118 @@ class FlickrSync:
 
 
 	def get(self, fid):
-		api = self.service.files().get(fileId=fid)
+		api = self.client.files().get(fileId=fid)
 		r = self.exea(api, "get")
 		uprint(str(r))
 		
 	def sets(self, verb = False):
-		uinfo('Get remote albums ...')
-		self._get_albums()
-		if verb:
-			self.print_albums(self.albums)
-
-	def _get_albums(self):
 		if self.albums:
 			return
 		
+		sys.stdout.write('  Get remote albums ......          ')
+		sys.stdout.flush()
+
 		self.albums = {}
-		pss = self.service.user.getPhotosets()
+		pages = self.list_albums()
+		if pages > 1:
+			self.syncCount = pages
+			self.syncQueue = queue.Queue()
+			for i in xrange(2, pages + 1):
+				self.syncQueue.put_nowait((i, pages))
+	
+			# start sync threads
+			threads = []
+			for i in xrange(config.max_threads):
+				thread = AlbumListThread(self)
+				threads.append(thread)
+				thread.start()
+			
+			# wait upload threads stop
+			self.join_threads(threads)
+		
+		sys.stdout.write("\n")
+		sys.stdout.flush()
+
+		if verb:
+			self.print_albums(self.albums)
+
+	def sets_run(self):
+		while not self.abandon:
+			try:
+				(page, pages) = self.syncQueue.get_nowait()
+				print_progress(page, pages)
+				self.list_albums(page)
+			except queue.Empty:
+				break
+			except Exception as e:
+				uexception(e)
+
+	def list_albums(self, page=1):
+		pss, pages = self.client.getAlbums(page)
 		if pss:
 			for s in pss:
 				self.albums[s.title] = s
+		return pages
 
-
-	def list(self, verb = False, url = False):
-		uinfo('Get remote files ...')
-
+	def list(self, sid=None, verb=False, url=False):
 		self.rfiles = {}
 		self.rpaths = {}
 
-		rphotos = self.service.user.getPhotos()
+		ps = self.get_photos(sid)
+		
+		for p in ps:
+			self.rpaths[p.title] = p
+			self.rfiles[p.id] = p
+
+		if verb:
+			self.print_photos(self.rpaths, url)
+
+	def get_photos(self, sid=None):
+		sys.stdout.write('  Get remote photos ......          ')
+		sys.stdout.flush()
+
+		self.photos = []
+		pages = self.list_photos(sid=sid)
+		if pages > 1:
+			self.syncCount = pages
+			self.syncQueue = queue.Queue()
+			for i in xrange(2, pages + 1):
+				self.syncQueue.put_nowait((i, pages))
+	
+			# start sync threads
+			threads = []
+			for i in xrange(config.max_threads):
+				thread = PhotoListThread(self, sid)
+				threads.append(thread)
+				thread.start()
+			
+			# wait upload threads stop
+			self.join_threads(threads)
+
+		sys.stdout.write("\n")
+		sys.stdout.flush()
+		
+		return self.photos
+
+	def list_photos(self, sid=None, page=1):
+		rphotos, pages = self.client.getPhotos(sid=sid, page=page)
 		if rphotos:
 			for p in rphotos:
-				if not p.title:
-					p.title = p.id
-				if p.title[0] != '/':
-					p.title = '/' + p.title
-				
 				if not self.accept_path(p.title):
 					continue
-				
-				p.mdate = DT1970
-				p.fsize = -1
-				if p.description:
-					try:
-						a = json.loads(p.description)
-						p.fsize = a['fsize']
-						p.mdate = todate(a['mdate'])
-					except Exception, e:
-						uwarn('Invalid description: %s - %s' % (p.description, str(e)))
-				p.action = ''
-				p.reason = ''
-				p.npath = os.path.abspath(config.root_dir + p.title)
+				self.photos.append(p)
+		return pages
 
-				self.rpaths[p.title] = p
-				self.rfiles[p.id] = p
-
-			if verb:
-				self.print_photos(self.rpaths, url)
+	def list_run(self, sid=None):
+		while not self.abandon:
+			try:
+				(page, pages) = self.syncQueue.get_nowait()
+				print_progress(page, pages)
+				self.list_photos(sid=sid, page=page)
+			except queue.Empty:
+				break
+			except Exception as e:
+				uexception(e)
 
 	def accept_path(self, path):
 		"""
@@ -778,7 +1180,7 @@ class FlickrSync:
 				if not (ext in config.fileexts):
 					continue
 
-				fp = flickr.Photo(0)
+				fp = FPhoto()
 				fp.action = ''
 				fp.reason = ''
 				fp.npath = np
@@ -1082,29 +1484,18 @@ class FlickrSync:
 	def up_to_date(self):
 		touch(config.token_file)
 
-	def trash_remote_file(self, file):
+	def trash_remote_file(self, rf):
 		"""
 		Move a remote file to the trash.
 		"""
-		uinfo("%s ^TRASH^  %s [%s] (%s)" % (self.prog(), file.title, szstr(file.fsize), tmstr(file.mdate)))
+		uinfo("%s ^TRASH^  %s [%s] (%s)" % (self.prog(), rf.title, szstr(rf.fsize), tmstr(rf.mdate)))
 
-		file.delete()
+		self.client.deletePhoto(rf)
 		with LOCK:
-			self.rfiles.pop(file.id, file)
-			self.rpaths.pop(file.title, file)
+			self.rfiles.pop(rf.id, rf)
+			self.rpaths.pop(rf.title, rf)
 
-	def read_exif(self, lf):
-		'''
-		Insert a file to remote.
-		'''
-		udebug("Getting EXIF for %s" % lf.title)
-
-		with open(lf.npath, 'rb') as f:
-			try:
-				exiftags = exifread.process_file(f)
-			except:
-				exiftags = {}
-		
+	def _make_tags(self, lf):
 		# make one tag equal to original file path with spaces replaced by
 		# # and start it with # (for easier recognition) since space is
 		# used as TAG separator by flickr
@@ -1113,18 +1504,8 @@ class FlickrSync:
 		tags = ''
 		ts = re.split(config.tag_split_re, lf.title)
 		for t in ts:
-			if t:
+			if t and len(t) > 1:
 				tags += t.replace(' ', '_') + ' '
-
-		if exiftags == {}:
-			udebug('NO_EXIF_HEADER for %s' % lf.title)
-		else:
-			# look for additional tags in EXIF to tag picture with
-			if config.exif_tag_keywords in exiftags:
-				printable = exiftags[config.exif_tag_keywords].printable
-				if len(printable) > 4:
-					exifstring = exifread.make_string(eval(printable))
-					tags += exifstring.replace(';', ' ')
 
 		lf.tags = tags.strip()
 	
@@ -1134,13 +1515,13 @@ class FlickrSync:
 			uwarn("%s Unable to upload %s, File size [%s] exceed the limit" % (self.prog(), lf.title, szstr(lf.fsize)))
 			return
 
-		self.read_exif(lf)
+		self._make_tags(lf)
 
 		'''
 		Upload a file to remote.
 		'''
 		uinfo("%s ^UPLOAD^ %s [%s] (%s) #(%s)" % (self.prog(), lf.title, szstr(lf.fsize), tmstr(lf.mdate), lf.tags))
-		lf.id = self.service.upload(lf)
+		lf.id = self.client.uploadPhoto(lf)
 		if lf.id:
 			with LOCK:
 				# add to remote files
@@ -1149,24 +1530,8 @@ class FlickrSync:
 				self.rnews[lf.title] = lf
 
 	def update_remote_file(self, rf, lf):
-		if lf.fsize > config.max_file_size:
-			self.skips.append(lf)
-			uwarn("%s Unable to update %s, File size [%s] excceed the limit" % (self.prog(), lf.title, szstr(lf.fsize)))
-			return
-
-		self.read_exif(lf)
-
-		'''
-		Update a file to remote.
-		'''
-		uinfo("%s ^UPDATE^ %s [%s] (%s) #(%s)" % (self.prog(), lf.title, szstr(lf.fsize), tmstr(lf.mdate), lf.tags))
-
-		lf.id = self.service.update(lf)
-		if lf.id:
-			rf.fsize = lf.fsize
-			rf.mdate = lf.mdate
-			rf.description = lf.description
-			rf.tags = lf.tags
+		self.trash_remote_file(rf)
+		self.insert_remote_file(lf)
 
 	def download_remote_file(self, rf):
 		uinfo("%s >DNLOAD> %s [%s] (%s)" % (self.prog(), rf.title, szstr(rf.fsize), tmstr(rf.mdate)))
@@ -1174,14 +1539,13 @@ class FlickrSync:
 		mkpdirs(rf.npath)
 
 		if rf.fsize == 0:
-			with open(rf.npath, "wb") as f:
-				pass
+			open(rf.npath, "wb").close()
 		else:
 			url = rf.url
-			if rf.media == 'video':
-				url = rf.getURL('Video Original', 'source')
+			if rf.video:
+				url = self.client.getPhotoURL(rf, 'Video Original', 'source')
 				uinfo("%s >>URL>>  %s" % (self.prog(), url))
-			self.service.download(url, rf.npath)
+			self.client.download(url, rf.npath)
 
 		touch(rf.npath, rf.mdate)
 
@@ -1194,7 +1558,7 @@ class FlickrSync:
 		meta = { 'fsize': fsize, 'mdate': mtstr(mdate) }
 		desc = json.dumps(meta)
 		
-		rf.setMeta(rf.title, desc)
+		self.client.setPhotoMeta(rf, rf.title, desc)
 
 		rf.mdate = mdate
 		rf.fsize = fsize
@@ -1243,20 +1607,8 @@ class FlickrSync:
 	def prog(self):
 		return ('[%d/%d]' % (self.syncCount - self.syncQueue.qsize(), self.syncCount))
 
-	def sync_files(self, sfiles):
-		self.syncCount = len(sfiles)
-		self.syncQueue = Queue.Queue()
-		for sf in sfiles:
-			self.syncQueue.put_nowait(sf)
-
-		# start sync threads
-		threads = []
-		for i in xrange( config.max_threads ):
-			thread = SyncThread(i + 1, self)
-			threads.append(thread)
-			thread.start()
-		
-		# wait upload threads stop
+	def join_threads(self, threads):
+		# wait threads stop
 		while threads:
 			try:
 				for thrd in threads:
@@ -1268,10 +1620,26 @@ class FlickrSync:
 				uinfo("Keyboard interrupt seen, abandon threads")
 				uprint(">>>>>> Stopping threads...")
 				self.abandon = True
+		
+	def sync_files(self, sfiles):
+		self.syncCount = len(sfiles)
+		self.syncQueue = queue.Queue()
+		for sf in sfiles:
+			self.syncQueue.put_nowait(sf)
+
+		# start sync threads
+		threads = []
+		for i in xrange(config.max_threads):
+			thread = PhotoSyncThread(i + 1, self)
+			threads.append(thread)
+			thread.start()
+		
+		# wait upload threads stop
+		self.join_threads(threads)
 
 		if not self.abandon and self.rnews:
 			# start Album thread
-			thrd = AlbumThread(self)
+			thrd = AlbumUpdateThread(self)
 			thrd.start()
 			
 			while thrd.isAlive():
@@ -1289,9 +1657,9 @@ class FlickrSync:
 			try:
 				sf = self.syncQueue.get_nowait()
 				self.sync_file(sf)
-			except Queue.Empty:
+			except queue.Empty:
 				break
-			except Exception, e:
+			except Exception as e:
 				uexception(e)
 
 
@@ -1305,12 +1673,50 @@ class FlickrSync:
 		if not self.albums:
 			return
 		
+		self._clear_albums()
+
+	def _clear_albums(self):
 		t = len(self.albums)
 		i = 0
-		for k,a in self.albums.items():
+		for a in self.albums.values():
 			i += 1
 			uinfo("[%d/%d] Delete album [%s]: %s" % (i, t, str(a.id), a.title))
-			a.delete()
+			self.client.deleteAlbum(a)
+		self.albums = {}
+
+	def build_albums(self, ps = None):
+		self.sets()
+
+		if ps is None:
+			self.list()
+			ps = self.rpaths
+	
+		self._clear_albums()
+
+		uinfo("Building Albums ...")
+		pns = list(ps.keys())
+		pns.sort()
+		
+		lastSetName = ''
+		aps = []  # album photos
+		for pn in pns:
+			if self.abandon:
+				return
+
+			setName = os.path.dirname(pn)
+			if lastSetName == '':
+				lastSetName = setName
+			
+			if lastSetName == setName:
+				aps.append(ps[pn])
+				continue
+			
+			self.update_album(lastSetName, aps)
+			aps = [ ps[pn] ]
+			lastSetName = setName
+
+		if aps:
+			self.update_album(lastSetName, aps)
 
 	def update_albums(self, ps):
 		self.sets()
@@ -1345,38 +1751,6 @@ class FlickrSync:
 		if aps and upd:
 			self.update_album(lastSetName, aps)
 
-	def build_albums(self, ps = None):
-		self.sets()
-
-		if ps is None:
-			self.list()
-			ps = self.rpaths
-
-		uinfo("Building Albums ...")
-		pns = list(ps.keys())
-		pns.sort()
-		
-		lastSetName = ''
-		aps = []  # album photos
-		for pn in pns:
-			if self.abandon:
-				return
-
-			setName = os.path.dirname(pn)
-			if lastSetName == '':
-				lastSetName = setName
-			
-			if lastSetName == setName:
-				aps.append(ps[pn])
-				continue
-			
-			self.update_album(lastSetName, aps)
-			aps = [ ps[pn] ]
-			lastSetName = setName
-
-		if aps:
-			self.update_album(lastSetName, aps)
-
 	"""
 	Creates or updates a album/set on flickr with the given photos.
 	"""
@@ -1394,26 +1768,27 @@ class FlickrSync:
 
 		if fset is None:
 			udebug("Create album [%s] with photo %s" % (setName, photos[0].title))
-			fset = flickr.Photoset.create(photos[0], setName, "Auto-generated by FlickrSync")
+			fset = self.client.newAlbum(photos[0], setName, "Auto-generated by FlickrSync")
 			self.albums[fset.title] = fset
 
 		if len(photos) > 1:
 			udebug('Add %d photos to album/set [%s]' % (len(photos), setName))
-			fset.editPhotos(photos)
+			self.client.addAlbumPhotos(fset, photos)
 
 	def list_album_photos(self, atitle):
-		self.tree()
+		self.sets()
 
 		a = self.albums.get(atitle)
-		if a:
-			uinfo("List photos of album [%s]:" % (atitle))
-			ps = a.getPhotos()
-			self.print_photos(ps)
-		else:
+		if not a:
 			uinfo("Album [%s] not found" % (atitle))
+			return
+
+		uinfo("List photos of album [%s]:" % (atitle))
+		ps = self.get_photos(a.id)
+		self.print_photos(ps)
 
 	def delete_album(self, atitle, noprompt = False):
-		self.tree()
+		self.sets()
 
 		a = self.albums.get(atitle)
 		if a:
@@ -1423,12 +1798,12 @@ class FlickrSync:
 					return
 
 			uinfo("Delete album [%s]: %s" % (str(a.id), a.title))
-			a.delete()
+			self.client.deleteAlbum(a)
 		else:
 			uinfo("Album [%s] not found" % (atitle))
 
 	def drop_album(self, atitle, noprompt = False):
-		self.tree()
+		self.sets()
 
 		a = self.albums.get(atitle)
 		if a:
@@ -1437,7 +1812,7 @@ class FlickrSync:
 				if ans.lower() != "y":
 					return
 
-			ps = a.getPhotos()
+			ps = self.get_photos(a.id)
 			t = len(ps)
 			i = 0
 			for p in ps:
@@ -1446,7 +1821,7 @@ class FlickrSync:
 				p.delete()
 
 			uinfo("Delete album [%s]: %s" % (str(a.id), a.title))
-			a.delete()
+			self.client.deleteAlbum(a)
 		else:
 			uinfo("Album [%s] not found" % (atitle))
 
@@ -1474,20 +1849,37 @@ class FlickrSync:
 		uinfo("DROP Completed!")
 
 
-class SyncThread(threading.Thread):
+class PhotoSyncThread(threading.Thread):
 	def __init__(self, threadID, syncFlickr):
 		threading.Thread.__init__(self)
 		self.threadID = threadID
 		self.syncFlickr = syncFlickr
 
 	def run(self):
-		uinfo("Starting SyncThread %d " % self.threadID)
+		uinfo("Starting PhotoSyncThread %d " % self.threadID)
 
 		self.syncFlickr.sync_run()
 
-		uinfo("Exiting SyncThread %d " % self.threadID)
+		uinfo("Exiting PhotoSyncThread %d " % self.threadID)
 
-class AlbumThread(threading.Thread):
+class PhotoListThread(threading.Thread):
+	def __init__(self, syncFlickr, sid):
+		threading.Thread.__init__(self)
+		self.syncFlickr = syncFlickr
+		self.sid = sid
+
+	def run(self):
+		self.syncFlickr.list_run(self.sid)
+
+class AlbumListThread(threading.Thread):
+	def __init__(self, syncFlickr):
+		threading.Thread.__init__(self)
+		self.syncFlickr = syncFlickr
+
+	def run(self):
+		self.syncFlickr.sets_run()
+
+class AlbumUpdateThread(threading.Thread):
 	def __init__(self, syncFlickr):
 		threading.Thread.__init__(self)
 		self.syncFlickr = syncFlickr
@@ -1496,7 +1888,7 @@ class AlbumThread(threading.Thread):
 		self.syncFlickr.update_albums(self.syncFlickr.rpaths)
 
 
-def help():
+def showUsage():
 	print("flickrsync.py <command> ...")
 	print("  <command>: ")
 	print("    help                print command usage")
@@ -1579,12 +1971,12 @@ def main(args):
 	if len(args) > 0:
 		cmd = args[0]
 	if cmd == 'help':
-		help()
+		showUsage()
 		exit(0)
 
 	uinfo('Start...')
 
-	fc = FlickrService()
+	fc = FlickrClient()
 	fs = FlickrSync(fc)
 	
 	opt1 = '' if len(args) < 2 else args[1]
@@ -1608,7 +2000,7 @@ def main(args):
 				config.includes = opt[1:].split()
 			elif ch == '-':
 				config.excludes = opt[1:].split()
-		fs.list(True, url)
+		fs.list(verb=True, url=url)
 	elif cmd == 'tree':
 		idx = 1
 		while (idx < len(args)):
@@ -1651,11 +2043,11 @@ def main(args):
 	elif cmd == 'touch':
 		fs.touch(True if 'go' in args else False)
 	else:
-		help()
+		showUsage()
 
 if __name__ == "__main__":
 	try:
 		main(sys.argv[1:])
-	except IOError, ex:
-		print ex
+	except IOError as ex:
+		print(ex)
 
