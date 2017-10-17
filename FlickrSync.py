@@ -64,6 +64,8 @@ except ImportError:
 
 if sys.version_info >= (3, 0):
 	import queue
+	def urlrequest(url, data=None, headers={}):
+		return urllib.request.Request(url, data, headers)
 	def urlopen(u):
 		return urllib.request.urlopen(u)
 	def urlquote(u):
@@ -79,6 +81,8 @@ else:
 	queue = Queue
 	
 	import urllib2
+	def urlrequest(url, data=None, headers={}):
+		return urllib2.Request(url, data, headers)
 	def urlopen(u):
 		return urllib2.urlopen(u)
 	def urlquote(u):
@@ -190,19 +194,6 @@ def trimdir(p):
 	if p[-1] == os.path.sep:
 		p = p[:-1]
 	return unicode(p)
-
-
-def get_content_type(filename):
-	return mimetypes.guess_type(filename)[0] or 'application/octet-stream'
-
-
-def iter_fields(fields):
-	"""Iterate over fields.
-		Supports list of (k, v) tuples and dicts.
-	"""
-	if isinstance(fields, dict):
-		return ((k, v) for k, v in fields.iteritems())
-	return ((k, v) for k, v in fields)
 
 
 def get_json_item(o):
@@ -468,19 +459,16 @@ class FlickrAPI(object):
 									  self.consumer,
 									  self.token)
 
-				all_upload_params = dict(parse_qsl(faux_req.to_postdata()))
+				fields = dict(parse_qsl(faux_req.to_postdata()))
 
-				# For Tumblr, all media (photos, videos)
-				# are sent with the 'data' parameter
-				all_upload_params['photo'] = (files.name, files.read())
-				body, content_type = self.encode_multipart_formdata(all_upload_params)
+				body, content_type = self.encode_multipart_formdata(fields, files)
 
 				headers.update({
 					'Content-Type': content_type,
 					'Content-Length': str(len(body))
 				})
 
-				req = urllib2.Request(http_url, body, headers)
+				req = urlrequest(http_url, body, headers)
 				try:
 					req = urlopen(req)
 				except Exception as e:
@@ -559,53 +547,44 @@ class FlickrAPI(object):
 		params = params or {}
 		return self.api_request(endpoint, method='POST', params=params, files=files, replace=replace)
 
-	# Thanks urllib3 <3
-	def encode_multipart_formdata(self, fields, boundary=None):
+	def encode_multipart_formdata(self, fields, files, boundary=None):
+		""" Encodes fields and files for uploading.
+		fields is a sequence of (name, value) elements for regular form fields - or a dictionary.
+		files is a sequence of (name, path) elements for files - or a dictionary.
+		Return (body, content_type) ready for urllib2.Request instance
 		"""
-		Encode a dictionary of ``fields`` using the multipart/form-data mime format.
-
-		:param fields:
-			Dictionary of fields or list of (key, value) field tuples.  The key is
-			treated as the field name, and the value as the body of the form-data
-			bytes. If the value is a tuple of two elements, then the first element
-			is treated as the filename of the form-data section.
-
-			Field names and filenames must be unicode.
-
-		:param boundary:
-			If not specified, then a random boundary will be generated using
-			:func:`mimetools.choose_boundary`.
-		"""
-		body = BytesIO()
+		
 		if boundary is None:
-			boundary = str(random.random()) + '_' + str(random.random())
+			boundary = '_' + str(random.random()) + '_' + str(random.random()) + '_'
 
-		for fieldname, value in iter_fields(fields):
-			body.write('--%s\r\n' % (boundary))
+		body = BytesIO()
+		cbody = UTF8(body)
 
-			if isinstance(value, tuple):
-				filename, data = value
-				UTF8(body).write('Content-Disposition: form-data; name="%s"; '
-								   'filename="%s"\r\n' % (fieldname, filename))
-				body.write('Content-Type: %s\r\n\r\n' %
-						   (get_content_type(filename)))
-			else:
-				data = value
-				UTF8(body).write('Content-Disposition: form-data; name="%s"\r\n'
-								   % (fieldname))
-				body.write(b'Content-Type: text/plain\r\n\r\n')
+		if isinstance(fields, dict):
+			fields = fields.items()
+		for field, value in fields:
+			cbody.write('--%s\r\n' % (boundary))
+			cbody.write('Content-Disposition: form-data; name="%s"\r\n' % (field))
+			cbody.write('Content-Type: text/plain\r\n\r\n')
+			cbody.write(value)
+			cbody.write('\r\n')
 
-			if isinstance(data, int):
-				data = str(data)  # Backwards compatibility
+		if isinstance(files, dict):
+			files = files.items()
+		for (field, path) in files:
+			cbody.write('--%s\r\n' % (boundary))
+			cbody.write('Content-Disposition: form-data; name="%s"; filename="%s"\r\n' % 
+					(field, urlquote(os.path.basename(path).encode('utf8'))))
+			cbody.write('Content-Type: %s\r\n\r\n' % (mimetypes.guess_type(path)[0] or 'application/octet-stream'))
+			with open(path, 'rb') as f:
+				while True:
+					d = f.read(1048576)
+					if not d:
+						break
+					body.write(d)
+			cbody.write('\r\n')
 
-			if isinstance(data, unicode):
-				UTF8(body).write(data)
-			else:
-				body.write(data)
-
-			body.write(b'\r\n')
-
-		body.write('--%s--\r\n' % (boundary))
+		cbody.write('--%s--\r\n' % (boundary))
 
 		content_type = 'multipart/form-data; boundary=%s' % boundary
 
@@ -930,30 +909,28 @@ class FlickrClient:
 		meta = { 'fsize': photo.fsize, 'mdate': mtstr(photo.mdate) }
 		photo.description = json.dumps(meta)
 
-		with open(photo.npath, 'rb') as f:
-			d = {
-				"title"      : photo.title,
-				"description": photo.description,
-				"tags"       : photo.tags,
-				"hidden"     : photo.ishidden,
-				"is_public"  : photo.ispublic,
-				"is_friend"  : photo.isfriend,
-				"is_family"  : photo.isfamily
-			}
-	
-			r = self.fapi.post(params=d, files=f)
-			return r['photoid']
+		d = {
+			"title"      : photo.title,
+			"description": photo.description,
+			"tags"       : photo.tags,
+			"hidden"     : photo.ishidden,
+			"is_public"  : photo.ispublic,
+			"is_friend"  : photo.isfriend,
+			"is_family"  : photo.isfamily
+		}
+
+		r = self.fapi.post(params=d, files={ 'photo': photo.npath })
+		return r['photoid']
 
 	def updatePhoto(self, rf, lf):
-		with open(lf.npath, 'rb') as f:
-			pid = self.fapi.post(params={ 'photo_id': rf.id }, files=f, replace=True)
-			if pid:
-				meta = { 'fsize': lf.fsize, 'mdate': mtstr(lf.mdate) }
-				lf.description = json.dumps(meta)
-				self.setPhotoMeta(rf, description=lf.description)
-				if lf.tags and lf.tags != rf.tags:
-					self.setPhotoTags(rf, lf.tags)
-				return pid
+		pid = self.fapi.post(params={ 'photo_id': rf.id }, files={ 'photo': lf.npath }, replace=True)
+		if pid:
+			meta = { 'fsize': lf.fsize, 'mdate': mtstr(lf.mdate) }
+			lf.description = json.dumps(meta)
+			self.setPhotoMeta(rf, description=lf.description)
+			if lf.tags and lf.tags != rf.tags:
+				self.setPhotoTags(rf, lf.tags)
+			return pid
 		return None
 
 class FlickrSync:
