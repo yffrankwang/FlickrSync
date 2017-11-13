@@ -1056,6 +1056,8 @@ class FlickrSync:
 		self.rpaths = {}
 
 		ps = self.get_photos(sid)
+		if self.abandon:
+			return
 		
 		for p in ps:
 			self.rpaths[p.title] = p
@@ -1157,12 +1159,16 @@ class FlickrSync:
 				if not (ext in config.fileexts):
 					continue
 
+				fsz = os.path.getsize(np)
+				if fsz >= config.max_file_size:
+					continue
+				
 				fp = FPhoto()
 				fp.action = ''
 				fp.reason = ''
 				fp.npath = np
 				fp.title = normpath(rp)
-				fp.fsize = os.path.getsize(np)
+				fp.fsize = fsz
 				fp.mdate = mtime(np)
 				lpaths[fp.title] = fp
 
@@ -1348,6 +1354,8 @@ class FlickrSync:
 	def patch(self, noprompt):
 		# get remote files
 		self.list()
+		if self.abandon:
+			return
 		
 		# scan local files
 		self.scan()
@@ -1367,6 +1375,8 @@ class FlickrSync:
 	def touch(self, noprompt):
 		# get remote files
 		self.list()
+		if self.abandon:
+			return
 		
 		# scan local files
 		self.scan()
@@ -1386,6 +1396,8 @@ class FlickrSync:
 	def push(self, force = False, noprompt = False):
 		# get remote files
 		self.list()
+		if self.abandon:
+			return
 		
 		# scan local files
 		self.scan()
@@ -1411,6 +1423,8 @@ class FlickrSync:
 	def pull(self, force = False, noprompt = False):
 		# get remote files
 		self.list()
+		if self.abandon:
+			return
 		
 		# scan local files
 		self.scan()
@@ -1436,6 +1450,8 @@ class FlickrSync:
 	def sync(self, noprompt):
 		# get remote files
 		self.list()
+		if self.abandon:
+			return
 		
 		# scan local files
 		self.scan()
@@ -1666,6 +1682,8 @@ class FlickrSync:
 
 		if ps is None:
 			self.list()
+			if self.abandon:
+				return
 			ps = self.rpaths
 	
 		self._clear_albums()
@@ -1762,6 +1780,9 @@ class FlickrSync:
 
 		uinfo("List photos of album [%s]:" % (atitle))
 		ps = self.get_photos(a.id)
+		if self.abandon:
+			return
+
 		self.print_photos(ps)
 
 	def delete_album(self, atitle, noprompt = False):
@@ -1790,6 +1811,9 @@ class FlickrSync:
 					return
 
 			ps = self.get_photos(a.id)
+			if self.abandon:
+				return
+
 			t = len(ps)
 			i = 0
 			for p in ps:
@@ -1804,6 +1828,9 @@ class FlickrSync:
 
 	def drop(self, noprompt=False):
 		self.list()
+		if self.abandon:
+			return
+
 		pns = list(self.rpaths.keys())
 		if not pns:
 			return
@@ -1951,7 +1978,7 @@ def main(args):
 		showUsage()
 		exit(0)
 
-	uinfo('Start...')
+	uinfo('Start ...')
 
 	fc = FlickrClient()
 	fs = FlickrSync(fc)
