@@ -606,7 +606,6 @@ class FPhoto:
 		self.url = None
 		self.path = None
 		self.npath = None
-		self.fsize = None
 		self.mdate = DT1970
 		self.fsize = -1
 		self.parent = None
@@ -1187,7 +1186,7 @@ class FlickrSync:
 			rf = self.rpaths.get(lp)
 			if rf and lf.fsize == rf.fsize and math.fabs(tseconds(rf.mdate - lf.mdate)) > 2:
 				lf.action = '^~'
-				lf.reason = '| <> R:' + tmstr(rf.mdate)
+				lf.reason = '| <> R:[' + szstr(rf.fsize) + '] ' + tmstr(rf.mdate)
 				lps.append(lp)
 
 		lps.sort()
@@ -1208,7 +1207,7 @@ class FlickrSync:
 			lf = self.lpaths.get(rp)
 			if lf and lf.fsize == rf.fsize and math.fabs(tseconds(rf.mdate - lf.mdate)) > 2:
 				rf.action = '>~'
-				rf.reason = '| <> L:' + tmstr(lf.mdate)
+				rf.reason = '| <> L:[' + szstr(lf.fsize) + '] ' + tmstr(lf.mdate)
 				rps.append(rp)
 
 		rps.sort()
@@ -1232,7 +1231,7 @@ class FlickrSync:
 					if not force or lf.fsize == rf.fsize:
 						continue
 				lf.action = '^*'
-				lf.reason = '| > R:' + tmstr(rf.mdate)
+				lf.reason = '| > R:[' + szstr(rf.fsize) + '] ' + tmstr(rf.mdate)
 			elif lastsync:
 				if tseconds(lf.mdate - lastsync) > 2:
 					lf.action = '^+'
@@ -1272,7 +1271,7 @@ class FlickrSync:
 					if not force or lf.fsize == rf.fsize:
 						continue
 				rf.action = '>*'
-				rf.reason = '| > L:' + tmstr(lf.mdate)
+				rf.reason = '| > L:[' + szstr(lf.fsize) + '] ' + tmstr(lf.mdate)
 			elif lastsync:
 				if tseconds(rf.mdate - lastsync) > 2:
 					rf.action = '>+'
