@@ -2,19 +2,18 @@ import os
 
 # needs win32all to work on Windows
 if os.name == 'nt':
-	import win32con, win32file, pywintypes
-	LOCK_EX = win32con.LOCKFILE_EXCLUSIVE_LOCK
-	LOCK_SH = 0 # the default
-	LOCK_NB = win32con.LOCKFILE_FAIL_IMMEDIATELY
-	__overlapped = pywintypes.OVERLAPPED()
+	import multiprocessing
 
-	def lock(file, flags = LOCK_EX | LOCK_NB):
-		hfile = win32file._get_osfhandle(file.fileno())
-		win32file.LockFileEx(hfile, flags, 0, 0xffff0000, __overlapped)
+	locks = {}
+	def lock(file):
+		lock = multiprocessing.Lock()
+		lock.acquire()
+		locks[file.fileno()] = lock
 
 	def unlock(file):
-		hfile = win32file._get_osfhandle(file.fileno())
-		win32file.UnlockFileEx(hfile, 0, 0xffff0000, __overlapped)
+		lock = locks.get(file.fileno())
+		if lock:
+			lock.release()
 
 elif os.name == 'posix':
 	import fcntl
